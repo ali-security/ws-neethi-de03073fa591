@@ -23,10 +23,13 @@ import java.io.BufferedReader;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -37,6 +40,8 @@ import javax.xml.namespace.QName;
 
 import org.apache.neethi.builders.PolicyContainingPrimitiveAssertion;
 import org.apache.neethi.builders.PrimitiveAssertion;
+
+import static org.apache.neethi.PolicyReference.MAX_REMOTE_POLICY_BYTES_PROPERTY;
 
 import org.junit.Test;
 
@@ -527,6 +532,170 @@ public class PolicyReferenceTest extends PolicyTestCase {
         assertTrue(alternatives.hasNext());
         assertEquals(4, alternatives.next().size());
         assertFalse(alternatives.hasNext());
+    }
+
+    @Test
+    public void testRemotePolicyDeclaredContentLengthAboveLimitIsRejected() throws Exception {
+        String previous = System.getProperty(MAX_REMOTE_POLICY_BYTES_PROPERTY);
+        System.setProperty(MAX_REMOTE_POLICY_BYTES_PROPERTY, "1024");
+
+        byte[] payload = buildLargePolicyPayload(2048);
+        try (LocalHttpServer server = LocalHttpServer.fixedLength(payload)) {
+            String url = "http://127.0.0.1:" + server.getPort() + "/policy.xml";
+            PolicyReference ref = new PolicyReference(policyEngine);
+            try {
+                ref.getRemoteReferencedPolicy(url);
+                fail("Expected RuntimeException due to remote response byte budget");
+            } catch (RuntimeException ex) {
+                assertTrue(ex.getMessage().contains("maximum remote policy size"));
+            }
+        } finally {
+            restoreProperty(MAX_REMOTE_POLICY_BYTES_PROPERTY, previous);
+        }
+    }
+
+    @Test
+    public void testRemotePolicyChunkedResponseAboveLimitIsRejected() throws Exception {
+        String previous = System.getProperty(MAX_REMOTE_POLICY_BYTES_PROPERTY);
+        System.setProperty(MAX_REMOTE_POLICY_BYTES_PROPERTY, "1024");
+
+        byte[] payload = buildLargePolicyPayload(4096);
+        try (LocalHttpServer server = LocalHttpServer.chunked(payload)) {
+            String url = "http://127.0.0.1:" + server.getPort() + "/policy.xml";
+            PolicyReference ref = new PolicyReference(policyEngine);
+            try {
+                ref.getRemoteReferencedPolicy(url);
+                fail("Expected RuntimeException due to remote response byte budget");
+            } catch (RuntimeException ex) {
+                assertTrue(ex.getMessage().contains("maximum remote policy size"));
+            }
+        } finally {
+            restoreProperty(MAX_REMOTE_POLICY_BYTES_PROPERTY, previous);
+        }
+    }
+
+    private static void restoreProperty(String key, String previous) {
+        if (previous == null) {
+            System.clearProperty(key);
+        } else {
+            System.setProperty(key, previous);
+        }
+    }
+
+    private static byte[] buildLargePolicyPayload(int totalBytes) {
+        String prefix = "<wsp:Policy xmlns:wsp=\"http://www.w3.org/ns/ws-policy\">";
+        String suffix = "</wsp:Policy>";
+        int middleSize = Math.max(0, totalBytes - prefix.length() - suffix.length());
+        char[] middle = new char[middleSize];
+        Arrays.fill(middle, ' ');
+        String xml = prefix + new String(middle) + suffix;
+        return xml.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static final class LocalHttpServer implements AutoCloseable {
+        private final ServerSocket serverSocket;
+        private final Thread serverThread;
+        private final byte[] payload;
+        private final boolean sendContentLength;
+        private final CountDownLatch ready = new CountDownLatch(1);
+        private final AtomicBoolean closed = new AtomicBoolean(false);
+
+        static LocalHttpServer fixedLength(byte[] payload) throws IOException {
+            return new LocalHttpServer(payload, true);
+        }
+
+        static LocalHttpServer chunked(byte[] payload) throws IOException {
+            return new LocalHttpServer(payload, false);
+        }
+
+        LocalHttpServer(byte[] payload, boolean sendContentLength) throws IOException {
+            this.payload = payload;
+            this.sendContentLength = sendContentLength;
+            this.serverSocket = new ServerSocket(0);
+            this.serverThread = new Thread(new Runnable() {
+                public void run() {
+                    serveOnce();
+                }
+            }, "policy-reference-test-server");
+            this.serverThread.setDaemon(true);
+            this.serverThread.start();
+            awaitReady();
+        }
+
+        int getPort() {
+            return serverSocket.getLocalPort();
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (closed.compareAndSet(false, true)) {
+                serverSocket.close();
+                try {
+                    serverThread.join(1000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        private void awaitReady() throws IOException {
+            try {
+                if (!ready.await(1, TimeUnit.SECONDS)) {
+                    throw new IOException("Test HTTP server did not start in time");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted while waiting for test HTTP server", e);
+            }
+        }
+
+        private void serveOnce() {
+            ready.countDown();
+            try (Socket client = serverSocket.accept()) {
+                consumeRequest(client.getInputStream());
+                writeResponse(client.getOutputStream());
+            } catch (IOException ignored) {
+                // The tests close the server socket during cleanup.
+            }
+        }
+
+        private void consumeRequest(InputStream input) throws IOException {
+            byte[] buffer = new byte[1024];
+            int matched = 0;
+            while (matched < 4) {
+                int read = input.read(buffer);
+                if (read == -1) {
+                    break;
+                }
+                for (int i = 0; i < read; i++) {
+                    byte b = buffer[i];
+                    if ((matched == 0 || matched == 2) && b == '\r') {
+                        matched++;
+                    } else if ((matched == 1 || matched == 3) && b == '\n') {
+                        matched++;
+                    } else {
+                        matched = 0;
+                    }
+                    if (matched == 4) {
+                        return;
+                    }
+                }
+            }
+        }
+
+        private void writeResponse(OutputStream out) throws IOException {
+            StringBuilder response = new StringBuilder();
+            response.append("HTTP/1.1 200 OK\r\n");
+            response.append("Content-Type: application/xml\r\n");
+            response.append("Connection: close\r\n");
+            if (sendContentLength) {
+                response.append("Content-Length: ").append(payload.length).append("\r\n");
+            }
+            response.append("\r\n");
+            out.write(response.toString().getBytes(StandardCharsets.US_ASCII));
+            out.write(payload);
+            out.flush();
+        }
     }
 
     private static final String REMOTE_POLICY =

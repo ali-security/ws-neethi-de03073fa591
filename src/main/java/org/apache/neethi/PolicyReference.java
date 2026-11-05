@@ -19,6 +19,8 @@
 
 package org.apache.neethi;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
@@ -45,14 +47,22 @@ public class PolicyReference implements PolicyComponent {
      */
     public static final String PIN_ADDRESS_PROPERTY = "org.apache.neethi.remote.pinAddress";
 
+    public static final String MAX_REMOTE_POLICY_BYTES_PROPERTY = "org.apache.neethi.remote.maxPolicyBytes";
+    private static final long DEFAULT_MAX_REMOTE_POLICY_BYTES = 64L * 1024L * 1024L;
+
     private String uri;
     private PolicyBuilder engine;
+    private final long maxRemotePolicyBytes;
 
     public PolicyReference() {
+        maxRemotePolicyBytes = readConfiguredLimit(MAX_REMOTE_POLICY_BYTES_PROPERTY,
+                                                   DEFAULT_MAX_REMOTE_POLICY_BYTES);
     }
     
     public PolicyReference(PolicyBuilder p) {
         engine = p;
+        maxRemotePolicyBytes = readConfiguredLimit(MAX_REMOTE_POLICY_BYTES_PROPERTY,
+                                                   DEFAULT_MAX_REMOTE_POLICY_BYTES);
     }
     
     /**
@@ -213,18 +223,63 @@ public class PolicyReference implements PolicyComponent {
             // scheme and address checks above
             ((HttpURLConnection) connection).setInstanceFollowRedirects(false);
 
+            long declaredLength = connection.getContentLengthLong();
+            if (declaredLength > maxRemotePolicyBytes) {
+                throw new RuntimeException(
+                    "Remote policy response exceeded the maximum remote policy size ("
+                    + maxRemotePolicyBytes + " bytes).");
+            }
+
             InputStream in = connection.getInputStream();
             try {
+                byte[] payload = readBounded(in, maxRemotePolicyBytes);
                 PolicyBuilder pe = engine;
                 if (pe == null) {
                     pe = new PolicyBuilder();
                 }
-                return pe.getPolicy(connection.getInputStream());
+                return pe.getPolicy(new ByteArrayInputStream(payload));
             } finally {
                 in.close();
             }
         } catch (IOException ioe) {
             throw new RuntimeException("Cannot reach remote policy reference.");
+        }
+    }
+
+    private static byte[] readBounded(InputStream input, long maxBytes) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        long total = 0;
+
+        while (true) {
+            int read = input.read(buffer);
+            if (read == -1) {
+                break;
+            }
+
+            total += read;
+            if (total > maxBytes) {
+                throw new RuntimeException(
+                    "Remote policy response exceeded the maximum remote policy size ("
+                    + maxBytes + " bytes).");
+            }
+
+            out.write(buffer, 0, read);
+        }
+
+        return out.toByteArray();
+    }
+
+    private static long readConfiguredLimit(String key, long defaultValue) {
+        String value = System.getProperty(key);
+        if (value == null || value.trim().length() == 0) {
+            return defaultValue;
+        }
+        try {
+            long parsed = Long.parseLong(value.trim());
+            return parsed > 0 ? parsed : defaultValue;
+        } catch (NumberFormatException ex) {
+            return defaultValue;
         }
     }
 
