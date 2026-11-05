@@ -36,11 +36,33 @@ public abstract class AbstractPolicyOperator implements PolicyOperator {
      * The PolicyReferences currently being resolved by a normalization running on this
      * thread. It is shared with nested normalizations (e.g. an Assertion normalizing the
      * Policy it contains) so that a circular reference running through such a nested
-     * Policy is detected as well.
+     * Policy is detected as well.  The same holds for the materialized-component budget
+     * of that normalization, so a nested Policy cannot reset it.
      */
-    private static final ThreadLocal<Set<String>> RESOLVING_REFERENCES = new ThreadLocal<Set<String>>();
+    private static final ThreadLocal<NormalizeBudget> NORMALIZE_BUDGET = new ThreadLocal<NormalizeBudget>();
 
     protected List<PolicyComponent> policyComponents = new ArrayList<PolicyComponent>();
+
+    /**
+     * Maximum number of normalised alternatives (All nodes inside the outermost
+     * ExactlyOne) that policy normalization is permitted to produce.  Crafted
+     * WS-Policy documents can trigger an exponential Cartesian cross-product that
+     * exhausts the JVM heap; this cap converts that unbounded allocation into a
+     * fast, predictable RuntimeException.
+     */
+    private static final int MAX_ALTERNATIVES = 10_000;
+
+    /**
+     * Maximum total number of component references normalization may
+     * materialize while building cross-product alternatives.  The
+     * alternative-count cap bounds how many alternatives exist but not their
+     * width: every produced alternative copies the component lists of both
+     * parents, so a policy that stays under every parse budget and under the
+     * 10000-alternatives cap can still materialize hundreds of millions of
+     * references (alternatives x parent widths).  This cap keeps the promise
+     * of a fast, predictable RuntimeException instead of an OutOfMemoryError.
+     */
+    private static final long MAX_NORMALIZED_COMPONENTS = 5_000_000L;
     
     public AbstractPolicyOperator() {
         
@@ -94,17 +116,17 @@ public abstract class AbstractPolicyOperator implements PolicyOperator {
         }
         
         
-        Set<String> resolving = RESOLVING_REFERENCES.get();
-        boolean outermost = resolving == null;
+        NormalizeBudget budget = NORMALIZE_BUDGET.get();
+        boolean outermost = budget == null;
         if (outermost) {
-            resolving = new HashSet<String>();
-            RESOLVING_REFERENCES.set(resolving);
+            budget = new NormalizeBudget();
+            NORMALIZE_BUDGET.set(budget);
         }
         try {
-            result.addPolicyComponent(normalizeOperator(policy, policy, reg, deep, resolving));
+            result.addPolicyComponent(normalizeOperator(policy, policy, reg, deep, budget));
         } finally {
             if (outermost) {
-                RESOLVING_REFERENCES.remove();
+                NORMALIZE_BUDGET.remove();
             }
         }
         return result;
@@ -114,7 +136,7 @@ public abstract class AbstractPolicyOperator implements PolicyOperator {
                                                      PolicyOperator operator, 
                                                      PolicyRegistry reg,
                                                      boolean deep,
-                                                     Set<String> resolving) {
+                                                     NormalizeBudget budget) {
                         
         short type = operator.getType();
                 
@@ -171,41 +193,44 @@ public abstract class AbstractPolicyOperator implements PolicyOperator {
                 String resolvedId = ((Policy) policyComponent).getId();
                 String resolvingToken = resolvedId != null && resolvedId.length() > 0
                     ? "id:" + resolvedId : "uri:" + uri;
-                if (!resolving.add(resolvingToken)) {
-                    throw new RuntimeException("Circular PolicyReference detected: " + resolvingToken);
-                }
+                budget.enterReference(resolvingToken);
                 try {
                     All all = new All();
                     all.addPolicyComponents(((Policy) policyComponent).getPolicyComponents());
-                    childComponentsList.add(AbstractPolicyOperator.normalizeOperator(policy, all, reg, deep, resolving));
+                    childComponentsList.add(AbstractPolicyOperator.normalizeOperator(policy, all, reg, deep, budget));
                 } finally {
-                    resolving.remove(resolvingToken);
+                    budget.exitReference(resolvingToken);
                 }
          
             } else if (policyComponent.getType() == Constants.TYPE_POLICY) {
                 All all = new All();
                 all.addPolicyComponents(((Policy) policyComponent).getPolicyComponents());
-                childComponentsList.add(AbstractPolicyOperator.normalizeOperator(policy, all, reg, deep, resolving));
+                childComponentsList.add(AbstractPolicyOperator.normalizeOperator(policy, all, reg, deep, budget));
                 
             } else {
                 childComponentsList.add(AbstractPolicyOperator
                                             .normalizeOperator(policy,
-                                                               (PolicyOperator)policyComponent, reg, deep, resolving));
+                                                               (PolicyOperator)policyComponent, reg, deep, budget));
             }            
         }
         
-        return computeResultantComponent(childComponentsList, type);
+        return computeResultantComponent(childComponentsList, type, budget);
     }
     
     private static PolicyComponent computeResultantComponent(List<PolicyComponent> normalizedInnerComponets, 
-                                                             short componentType) {
+                                                             short componentType,
+                                                             NormalizeBudget budget) {
         
         ExactlyOne exactlyOne = new ExactlyOne();
         
         if (componentType == Constants.TYPE_EXACTLYONE) {            
+            long alternativesSoFar = 0;
             for (PolicyComponent comp : normalizedInnerComponets) {
                 ExactlyOne innerExactlyOne = (ExactlyOne)comp;
+                int alternativesToAdd = innerExactlyOne.getPolicyComponents().size();
+                checkAlternativeBudget(alternativesSoFar + alternativesToAdd);
                 exactlyOne.addPolicyComponents(innerExactlyOne.getPolicyComponents());
+                alternativesSoFar += alternativesToAdd;
             }
             
         } else if ((componentType == Constants.TYPE_POLICY) || (componentType == Constants.TYPE_ALL)) {
@@ -227,7 +252,7 @@ public abstract class AbstractPolicyOperator implements PolicyOperator {
                             exactlyOne = currentExactlyOne;
                             break;
                         } else {
-                            exactlyOne = getCrossProduct(exactlyOne, currentExactlyOne);
+                            exactlyOne = getCrossProduct(exactlyOne, currentExactlyOne, budget);
                         }
                     }
 
@@ -239,11 +264,14 @@ public abstract class AbstractPolicyOperator implements PolicyOperator {
                 exactlyOne = (ExactlyOne) normalizedInnerComponets.get(0);
             }
         }
+
+        checkAlternativeBudget(exactlyOne.getPolicyComponents().size());
         
         return exactlyOne;
     }
     
-    private static ExactlyOne getCrossProduct(ExactlyOne exactlyOne1, ExactlyOne exactlyOne2) {
+    private static ExactlyOne getCrossProduct(ExactlyOne exactlyOne1, ExactlyOne exactlyOne2,
+                                              NormalizeBudget budget) {
         ExactlyOne crossProduct = new ExactlyOne();
         All crossProductAll;
 
@@ -254,7 +282,12 @@ public abstract class AbstractPolicyOperator implements PolicyOperator {
             currentAll1 = (All)pc;
 
             for (PolicyComponent pc2 : exactlyOne2.getPolicyComponents()) {
+                long nextSize = (long)crossProduct.getPolicyComponents().size() + 1;
+                checkAlternativeBudget(nextSize);
+
                 currentAll2 = (All)pc2;
+                budget.chargeComponents(currentAll1.getPolicyComponents().size()
+                                        + (long)currentAll2.getPolicyComponents().size());
                 crossProductAll = new All();
                 crossProductAll.addPolicyComponents(currentAll1.getPolicyComponents());
                 crossProductAll.addPolicyComponents(currentAll2.getPolicyComponents());
@@ -263,5 +296,49 @@ public abstract class AbstractPolicyOperator implements PolicyOperator {
         }
 
         return crossProduct;
+    }
+
+    /**
+     * Per-normalization accounting, shared with the nested normalizations it
+     * triggers: the on-path cycle set plus the budget that bounds the number of
+     * component references materialized while building cross-product alternatives.
+     */
+    private static final class NormalizeBudget {
+        private final Set<String> resolving = new HashSet<String>();
+        private long materializedComponents;
+
+        void enterReference(String token) {
+            if (!resolving.add(token)) {
+                throw new RuntimeException("Circular PolicyReference detected: " + token);
+            }
+        }
+
+        void exitReference(String token) {
+            resolving.remove(token);
+        }
+
+        void chargeComponents(long count) {
+            materializedComponents += count;
+            if (materializedComponents > MAX_NORMALIZED_COMPONENTS) {
+                throw new RuntimeException(
+                    "Policy normalization exceeded the maximum number of materialized"
+                    + " components (" + MAX_NORMALIZED_COMPONENTS + "). The policy may"
+                    + " be crafted to cause memory-exhaustion DoS via wide"
+                    + " cross-product alternatives.");
+            }
+        }
+    }
+
+    public static void checkMaximumAlternativeCount(long alternativesCount, String operation) {
+        if (alternativesCount > MAX_ALTERNATIVES) {
+            throw new RuntimeException(
+                "Policy " + operation + " exceeded the maximum number of alternatives ("
+                + MAX_ALTERNATIVES + "). The policy may be crafted to cause "
+                + "Algorithmic Complexity DoS via exponential expansion.");
+        }
+    }
+
+    private static void checkAlternativeBudget(long alternativesCount) {
+        checkMaximumAlternativeCount(alternativesCount, "normalization");
     }
 }
