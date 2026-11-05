@@ -63,6 +63,18 @@ public abstract class AbstractPolicyOperator implements PolicyOperator {
      * of a fast, predictable RuntimeException instead of an OutOfMemoryError.
      */
     private static final long MAX_NORMALIZED_COMPONENTS = 5_000_000L;
+
+    /**
+     * Maximum number of PolicyReference expansions a single normalization
+     * pass may perform.  The alternative-count cap alone cannot see reference
+     * re-expansion: a reference DAG in which every level holds two sibling
+     * references to the next level normalizes to a single alternative at each
+     * step while the expansion work doubles per level (2^d work from O(d)
+     * parsed elements, because the on-path cycle token is removed once each
+     * expansion completes).  Budgeting expansions converts that unbounded
+     * work into a fast, predictable RuntimeException.
+     */
+    private static final int MAX_REFERENCE_EXPANSIONS = 100_000;
     
     public AbstractPolicyOperator() {
         
@@ -300,16 +312,27 @@ public abstract class AbstractPolicyOperator implements PolicyOperator {
 
     /**
      * Per-normalization accounting, shared with the nested normalizations it
-     * triggers: the on-path cycle set plus the budget that bounds the number of
+     * triggers: the on-path cycle set, the budget that bounds total
+     * reference-expansion work, plus the budget that bounds the number of
      * component references materialized while building cross-product alternatives.
      */
     private static final class NormalizeBudget {
         private final Set<String> resolving = new HashSet<String>();
         private long materializedComponents;
+        private long referenceExpansions;
 
         void enterReference(String token) {
             if (!resolving.add(token)) {
                 throw new RuntimeException("Circular PolicyReference detected: " + token);
+            }
+            referenceExpansions++;
+            if (referenceExpansions > MAX_REFERENCE_EXPANSIONS) {
+                resolving.remove(token);
+                throw new RuntimeException(
+                    "Policy normalization exceeded the maximum number of PolicyReference"
+                    + " expansions (" + MAX_REFERENCE_EXPANSIONS + "). The policy may be"
+                    + " crafted to cause Algorithmic Complexity DoS via reference"
+                    + " re-expansion.");
             }
         }
 
