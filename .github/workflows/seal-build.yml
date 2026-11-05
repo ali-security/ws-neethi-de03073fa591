@@ -1,0 +1,70 @@
+# Sealed-libraries build workflow for Apache Neethi.
+# Upstream (Apache SVN/GitHub mirror) ships no CI; this mirrors the release build:
+# Maven (>= 3.3 per the enforcer rule) on JDK 1.7 (reference jar Build-Jdk 1.7.0_80),
+# `mvn package` with the pom's own surefire configuration running the full suite.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MAVEN_VERSION: 3.8.8
+      MAVEN_OPTS: -Dhttps.protocols=TLSv1.2 -Xmx1g
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 7
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "7"
+
+      - name: Install Maven ${{ env.MAVEN_VERSION }}
+        run: |
+          curl -fsSL "https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz" -o /tmp/maven.tgz
+          tar -xzf /tmp/maven.tgz -C /opt
+          echo "/opt/apache-maven-${MAVEN_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Build and test
+        run: |
+          java -version
+          mvn -v
+          # apache-rat (licence-header gate) is bound to the verify phase; not a test.
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn -B -e --no-transfer-progress clean package -Drat.skip=true \
+              -Dtest='${{ inputs.test-filter }}' -DfailIfNoTests=false
+          else
+            mvn -B -e --no-transfer-progress clean package -Drat.skip=true
+          fi
+
+      - name: Report test results
+        if: always()
+        run: |
+          shopt -s nullglob
+          for f in target/surefire-reports/TEST-*.xml; do
+            python3 - "$f" <<'EOF'
+          import sys, xml.etree.ElementTree as ET
+          r = ET.parse(sys.argv[1]).getroot()
+          print("%s: tests=%s failures=%s errors=%s skipped=%s" % (r.get("name"), r.get("tests"), r.get("failures"), r.get("errors"), r.get("skipped")))
+          for tc in r.iter("testcase"):
+              s = tc.find("skipped")
+              if s is not None:
+                  print("  SKIPPED %s.%s: %s" % (tc.get("classname"), tc.get("name"), s.get("message") or (s.text or "").strip() or "no message"))
+          EOF
+          done
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: neethi-jar
+          path: target/neethi-3.1.1.jar
+          if-no-files-found: error
