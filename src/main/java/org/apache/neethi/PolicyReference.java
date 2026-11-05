@@ -21,9 +21,13 @@ package org.apache.neethi;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.Inet6Address;
+import java.net.InetAddress;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLConnection;
+import java.net.UnknownHostException;
 
 import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamWriter;
@@ -32,6 +36,14 @@ import javax.xml.stream.XMLStreamWriter;
  * PolicyReference is a wrapper that holds explicit PolicyReferences.
  */
 public class PolicyReference implements PolicyComponent {
+
+    /**
+     * Set to "false" to disable rewriting http URLs to the vetted literal
+     * address (see getRemoteReferencedPolicy). Pinning is on by default; the
+     * opt-out exists for deployments that rely on name-based virtual hosting
+     * for http policy endpoints and accept the DNS-rebinding residual risk.
+     */
+    public static final String PIN_ADDRESS_PROPERTY = "org.apache.neethi.remote.pinAddress";
 
     private String uri;
     private PolicyBuilder engine;
@@ -136,11 +148,70 @@ public class PolicyReference implements PolicyComponent {
     }
     
     public Policy getRemoteReferencedPolicy(String u) {
+        URL url;
         try {
-            //create java.net URL pointing to remote resource
-            URL url = new URL(u);
-            URLConnection connection = url.openConnection();
+            url = new URL(u);
+        } catch (MalformedURLException mue) {
+            throw new RuntimeException("Malformed uri.");
+        }
+
+        String scheme = url.getProtocol();
+        if (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme)) {
+            throw new RuntimeException("Unsupported URI scheme: only http and https are permitted.");
+        }
+
+        // Resolve the host and reject addresses that can never serve a policy document:
+        //   - link-local  (169.254.x.x / fe80::/10) — cloud IMDS, auto-configuration
+        //   - multicast   (224.0.0.0/4 / ff00::/8)  — no HTTP server listens at a multicast address
+        //   - any-local   (0.0.0.0 / ::)             — unspecified/wildcard, not a valid destination
+        //   - IPv6 unique-local (fd00::/7)          - includes cloud IMDS IPv6 endpoints
+        //     (e.g. AWS fd00:ec2::254), the same class the link-local rejection targets
+        //   - IPv4 embedded in IPv6 (64:ff9b::/96 NAT64, ::ffff:0:0/96 mapped) whenever
+        //     the embedded IPv4 address would itself be rejected
+        // Loopback (127.x.x.x / ::1) and site-local (RFC-1918) addresses are permitted
+        // so that policies on localhost or an internal network can be resolved.
+        // EVERY address the host resolves to is vetted, so a multi-record DNS
+        // answer cannot smuggle a forbidden address past the filter.
+        InetAddress[] addresses;
+        try {
+            addresses = InetAddress.getAllByName(url.getHost());
+        } catch (UnknownHostException e) {
+            throw new RuntimeException("PolicyReference URI host could not be resolved.");
+        }
+        for (InetAddress addr : addresses) {
+            if (isForbiddenAddress(addr)) {
+                throw new RuntimeException(
+                    "PolicyReference URI resolves to a forbidden address (link-local, multicast,"
+                    + " wildcard, IPv6 unique-local, or an IPv6 form embedding one).");
+            }
+        }
+
+        // Pin the connection to an address that was actually vetted:
+        // URLConnection re-resolves the hostname at connect time, which opens
+        // a DNS-rebinding TOCTOU window between the check above and the
+        // connect. For http the URL host is rewritten to the vetted literal
+        // address (note: the JDK will send that literal in the Host header -
+        // see PIN_ADDRESS_PROPERTY to opt out for name-based virtual
+        // hosting). For https the hostname is kept: TLS certificate
+        // verification against the original hostname binds the peer identity,
+        // and a literal-address URL would break it.
+        URL connectionUrl = url;
+        if ("http".equalsIgnoreCase(scheme)
+            && !"false".equalsIgnoreCase(System.getProperty(PIN_ADDRESS_PROPERTY))) {
+            try {
+                connectionUrl = new URL(url.getProtocol(), toUrlHost(addresses[0]),
+                                        url.getPort(), url.getFile());
+            } catch (MalformedURLException mue) {
+                throw new RuntimeException("Malformed uri.");
+            }
+        }
+
+        try {
+            URLConnection connection = connectionUrl.openConnection();
             connection.setDoInput(true);
+            // never follow redirects: a redirect target is not vetted by the
+            // scheme and address checks above
+            ((HttpURLConnection) connection).setInstanceFollowRedirects(false);
 
             InputStream in = connection.getInputStream();
             try {
@@ -152,10 +223,73 @@ public class PolicyReference implements PolicyComponent {
             } finally {
                 in.close();
             }
-        } catch (MalformedURLException mue) {
-            throw new RuntimeException("Malformed uri: " + u);
-        } catch (IOException ioe) {        
-            throw new RuntimeException("Cannot reach remote resource: " + u);
+        } catch (IOException ioe) {
+            throw new RuntimeException("Cannot reach remote policy reference.");
         }
+    }
+
+    /**
+     * Returns whether the resolved address belongs to a class the reference
+     * fetcher must never connect to. Package-private for tests.
+     */
+    static boolean isForbiddenAddress(InetAddress addr) {
+        if (addr.isLinkLocalAddress() || addr.isMulticastAddress() || addr.isAnyLocalAddress()) {
+            return true;
+        }
+        if (addr instanceof Inet6Address) {
+            byte[] bytes = addr.getAddress();
+            // IPv6 unique-local (fd00::/7, RFC 4193): none of the JDK
+            // predicates above match it, yet it includes cloud metadata
+            // endpoints such as the AWS IMDS IPv6 endpoint fd00:ec2::254 -
+            // exactly the class the link-local rejection exists to block.
+            if ((bytes[0] & 0xfe) == 0xfc) {
+                return true;
+            }
+            // IPv4 embedded in IPv6 (NAT64 well-known prefix 64:ff9b::/96,
+            // RFC 6052, and IPv4-mapped ::ffff:0:0/96): classify by the
+            // embedded IPv4 address the gateway would deliver to.
+            InetAddress embedded = extractEmbeddedIpv4(bytes);
+            if (embedded != null && isForbiddenAddress(embedded)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static InetAddress extractEmbeddedIpv4(byte[] bytes) {
+        if (bytes.length != 16) {
+            return null;
+        }
+        boolean nat64 = bytes[0] == 0x00 && bytes[1] == 0x64
+            && bytes[2] == (byte) 0xff && bytes[3] == (byte) 0x9b;
+        for (int i = 4; nat64 && i < 12; i++) {
+            nat64 = bytes[i] == 0x00;
+        }
+        boolean mapped = true;
+        for (int i = 0; mapped && i < 10; i++) {
+            mapped = bytes[i] == 0x00;
+        }
+        mapped = mapped && bytes[10] == (byte) 0xff && bytes[11] == (byte) 0xff;
+        if (!nat64 && !mapped) {
+            return null;
+        }
+        try {
+            return InetAddress.getByAddress(
+                new byte[] {bytes[12], bytes[13], bytes[14], bytes[15]});
+        } catch (UnknownHostException e) {
+            // cannot happen for a 4-byte address; fail closed if it ever does
+            throw new RuntimeException(
+                "PolicyReference URI resolves to an address that could not be classified.");
+        }
+    }
+
+    private static String toUrlHost(InetAddress addr) {
+        String literal = addr.getHostAddress();
+        int scope = literal.indexOf('%');
+        if (scope >= 0) {
+            // an IPv6 scope id is not valid in a URL host
+            literal = literal.substring(0, scope);
+        }
+        return literal.indexOf(':') >= 0 ? "[" + literal + "]" : literal;
     }
 }
