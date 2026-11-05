@@ -20,15 +20,23 @@
 package org.apache.neethi;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.Iterator;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import javax.xml.namespace.QName;
+
+import org.apache.neethi.builders.PolicyContainingPrimitiveAssertion;
+import org.apache.neethi.builders.PrimitiveAssertion;
 
 import org.junit.Test;
 
@@ -314,6 +322,170 @@ public class PolicyReferenceTest extends PolicyTestCase {
                 System.setProperty(PolicyReference.PIN_ADDRESS_PROPERTY, old);
             }
         }
+    }
+
+    /**
+     * Ensures circular references are detected for policies with explicit Id values.
+     */
+    @Test
+    public void testCircularPolicyReferenceWithIdsIsDetected() {
+        // Build Policy A: ExactlyOne > All > PolicyReference("B")
+        PolicyReference refToB = new PolicyReference();
+        refToB.setURI("B");
+        All allA = new All();
+        allA.addPolicyComponent(refToB);
+        ExactlyOne eoA = new ExactlyOne();
+        eoA.addPolicyComponent(allA);
+        Policy policyA = new Policy(registry);
+        policyA.setId("A");
+        policyA.addPolicyComponent(eoA);
+
+        // Build Policy B: ExactlyOne > All > PolicyReference("A")
+        PolicyReference refToA = new PolicyReference();
+        refToA.setURI("A");
+        All allB = new All();
+        allB.addPolicyComponent(refToA);
+        ExactlyOne eoB = new ExactlyOne();
+        eoB.addPolicyComponent(allB);
+        Policy policyB = new Policy(registry);
+        policyB.setId("B");
+        policyB.addPolicyComponent(eoB);
+
+        registry.register("A", policyA);
+        registry.register("B", policyB);
+
+        try {
+            policyA.normalize(registry, true);
+            fail("Expected RuntimeException due to circular reference");
+        } catch (RuntimeException e) {
+            assertTrue(
+                "Expected a cycle-detection message but got: " + e.getMessage(),
+                e.getMessage() != null && e.getMessage().toLowerCase().contains("circular"));
+        }
+    }
+
+    /**
+     * Ensures a circular reference between two policies defined locally in a parsed
+     * policy document ("#A" references "#B", which references "#A") is detected.
+     */
+    @Test
+    public void testCircularLocalPolicyReferenceInDocumentIsDetected() throws Exception {
+        String xml = "<wsp:Policy xmlns:wsp=\"" + Constants.URI_POLICY_15_NS + "\""
+            + " xmlns:wsu=\"" + Constants.URI_WSU_NS + "\">"
+            + "<wsp:Policy wsu:Id=\"A\"><wsp:PolicyReference URI=\"#B\"/></wsp:Policy>"
+            + "<wsp:Policy wsu:Id=\"B\"><wsp:PolicyReference URI=\"#A\"/></wsp:Policy>"
+            + "</wsp:Policy>";
+        Policy policy = policyEngine.getPolicy(new ByteArrayInputStream(xml.getBytes("UTF-8")));
+
+        try {
+            policy.normalize(registry, true);
+            fail("Expected RuntimeException due to circular reference");
+        } catch (RuntimeException e) {
+            assertTrue(
+                "Expected a cycle-detection message but got: " + e.getMessage(),
+                e.getMessage() != null && e.getMessage().toLowerCase().contains("circular"));
+        }
+    }
+
+    /**
+     * Ensures a circular reference is detected when it runs through the nested Policy of an
+     * assertion: normalizing the assertion normalizes its nested Policy on its own, which
+     * must still see the references that are already being resolved.
+     */
+    @Test
+    public void testCircularPolicyReferenceThroughNestedAssertionPolicyIsDetected() {
+        // Policy A: ExactlyOne > All > Wrapper assertion > nested Policy > PolicyReference("A")
+        PolicyReference refToA = new PolicyReference();
+        refToA.setURI("A");
+        Policy nested = new Policy(registry);
+        nested.addPolicyComponent(refToA);
+        All allA = new All();
+        allA.addPolicyComponent(new PolicyContainingPrimitiveAssertion(
+            new QName("urn:neethi:test", "Wrapper"), false, false, nested));
+        ExactlyOne eoA = new ExactlyOne();
+        eoA.addPolicyComponent(allA);
+        Policy policyA = new Policy(registry);
+        policyA.setId("A");
+        policyA.addPolicyComponent(eoA);
+
+        registry.register("A", policyA);
+
+        try {
+            policyA.normalize(registry, true);
+            fail("Expected RuntimeException due to circular reference");
+        } catch (RuntimeException e) {
+            assertTrue(
+                "Expected a cycle-detection message but got: " + e.getMessage(),
+                e.getMessage() != null && e.getMessage().toLowerCase().contains("circular"));
+        }
+    }
+
+    /**
+     * Ensures a Policy that is referenced several times without forming a cycle (directly,
+     * and from the nested Policy of an assertion) still normalizes, including right after a
+     * circular reference has been rejected on the same thread.
+     */
+    @Test
+    public void testRepeatedNonCircularPolicyReferenceIsNormalized() {
+        // Policy C: a single assertion
+        Policy policyC = new Policy(registry);
+        policyC.setId("C");
+        policyC.addPolicyComponent(new PrimitiveAssertion(new QName("urn:neethi:test", "Leaf")));
+
+        // Policy B: All > { PolicyReference("C"), Wrapper assertion > nested Policy > PolicyReference("C") }
+        PolicyReference directRefToC = new PolicyReference();
+        directRefToC.setURI("C");
+        PolicyReference nestedRefToC = new PolicyReference();
+        nestedRefToC.setURI("C");
+        Policy nested = new Policy(registry);
+        nested.addPolicyComponent(nestedRefToC);
+        All allB = new All();
+        allB.addPolicyComponent(directRefToC);
+        allB.addPolicyComponent(new PolicyContainingPrimitiveAssertion(
+            new QName("urn:neethi:test", "Wrapper"), false, false, nested));
+        ExactlyOne eoB = new ExactlyOne();
+        eoB.addPolicyComponent(allB);
+        Policy policyB = new Policy(registry);
+        policyB.setId("B");
+        policyB.addPolicyComponent(eoB);
+
+        // Policy A: All > { PolicyReference("B"), PolicyReference("B") }
+        PolicyReference firstRefToB = new PolicyReference();
+        firstRefToB.setURI("B");
+        PolicyReference secondRefToB = new PolicyReference();
+        secondRefToB.setURI("B");
+        All allA = new All();
+        allA.addPolicyComponent(firstRefToB);
+        allA.addPolicyComponent(secondRefToB);
+        ExactlyOne eoA = new ExactlyOne();
+        eoA.addPolicyComponent(allA);
+        Policy policyA = new Policy(registry);
+        policyA.setId("A");
+        policyA.addPolicyComponent(eoA);
+
+        // First make C circular (C -> A -> B -> C) and check that the cycle is rejected.
+        PolicyReference refToA = new PolicyReference();
+        refToA.setURI("A");
+        policyC.addPolicyComponent(refToA);
+        registry.register("A", policyA);
+        registry.register("B", policyB);
+        registry.register("C", policyC);
+        try {
+            policyA.normalize(registry, true);
+            fail("Expected RuntimeException due to circular reference");
+        } catch (RuntimeException e) {
+            assertTrue(
+                "Expected a cycle-detection message but got: " + e.getMessage(),
+                e.getMessage() != null && e.getMessage().toLowerCase().contains("circular"));
+        }
+
+        // Break the cycle: the repeated references must now normalize to one alternative.
+        policyC.getPolicyComponents().remove(refToA);
+        Policy normalized = policyA.normalize(registry, true);
+        Iterator<List<Assertion>> alternatives = normalized.getAlternatives();
+        assertTrue(alternatives.hasNext());
+        assertEquals(4, alternatives.next().size());
+        assertFalse(alternatives.hasNext());
     }
 
     private static final String REMOTE_POLICY =
