@@ -365,6 +365,47 @@ public class PolicyReferenceTest extends PolicyTestCase {
     }
 
     /**
+     * Ensures circular references are detected even when referenced policies have no Id.
+     *
+     * Cycle detection must use a stable non-null resolution token so that
+     * no-Id references cannot bypass the resolving set.
+     */
+    @Test
+    public void testCircularPolicyReferenceWithoutIdsIsDetected() {
+        // Policy A references registry key "B" but has no policy Id.
+        PolicyReference refToB = new PolicyReference();
+        refToB.setURI("B");
+        All allA = new All();
+        allA.addPolicyComponent(refToB);
+        ExactlyOne eoA = new ExactlyOne();
+        eoA.addPolicyComponent(allA);
+        Policy policyA = new Policy(registry);
+        policyA.addPolicyComponent(eoA);
+
+        // Policy B references registry key "A" and also has no policy Id.
+        PolicyReference refToA = new PolicyReference();
+        refToA.setURI("A");
+        All allB = new All();
+        allB.addPolicyComponent(refToA);
+        ExactlyOne eoB = new ExactlyOne();
+        eoB.addPolicyComponent(allB);
+        Policy policyB = new Policy(registry);
+        policyB.addPolicyComponent(eoB);
+
+        registry.register("A", policyA);
+        registry.register("B", policyB);
+
+        try {
+            policyA.normalize(registry, true);
+            fail("Expected RuntimeException due to circular reference");
+        } catch (RuntimeException e) {
+            assertTrue(
+                "Expected a cycle-detection message but got: " + e.getMessage(),
+                e.getMessage() != null && e.getMessage().toLowerCase().contains("circular"));
+        }
+    }
+
+    /**
      * Ensures a circular reference between two policies defined locally in a parsed
      * policy document ("#A" references "#B", which references "#A") is detected.
      */
