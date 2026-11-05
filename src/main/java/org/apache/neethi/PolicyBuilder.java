@@ -254,6 +254,14 @@ public class PolicyBuilder {
             for (Map.Entry<QName, String> ent : attributes.entrySet()) {
                 policyOperator.addAttribute(ent.getKey(), ent.getValue());
             }
+        } else if (Constants.TYPE_POLICY != operator.getType()) {
+            // attributes on ExactlyOne/All operator elements were previously
+            // exempt from the maxAttributes budget
+            Map<QName, String> operatorAttributes =
+                factory.getConverterRegistry().getAttributes(operationElement);
+            if (operatorAttributes != null) {
+                context.incrementAttributeCount(operatorAttributes.size());
+            }
         }
 
         for (Iterator<?> iterator = factory.getConverterRegistry().getChildElements(operationElement); 
@@ -287,6 +295,7 @@ public class PolicyBuilder {
     }
 
     private Assertion buildAssertion(Object element, ParseBudgetContext context, int depth) {
+        context.incrementElementCount();
         int enclosingAssertionDepth = context.enterAssertion(depth);
         try {
             return factory.build(element);
@@ -366,6 +375,41 @@ public class PolicyBuilder {
         }
     }
     
+    /**
+     * Returns whether a policy parse is in progress on the current thread, i.e.
+     * whether an ambient budget is active. The converter layer uses this to
+     * decide whether an assertion-subtree materialization must be charged
+     * against the parse's maxElements/maxAttributes budget.
+     */
+    public static boolean hasAmbientParseBudget() {
+        return PARSE_BUDGET.get() != null;
+    }
+
+    /**
+     * Charges one materialized element against the budget of the policy parse
+     * in progress on the current thread, if any. Called by the converter
+     * layer when it copies an assertion subtree into a new representation, so
+     * that maxElements bounds every node materialized on behalf of a single
+     * top-level parse - not only wsp:* operator elements.
+     */
+    public static void chargeAmbientElement() {
+        ParseBudgetContext context = PARSE_BUDGET.get();
+        if (context != null) {
+            context.incrementElementCount();
+        }
+    }
+
+    /**
+     * Charges {@code count} materialized attributes against the budget of the
+     * policy parse in progress on the current thread, if any.
+     */
+    public static void chargeAmbientAttributes(int count) {
+        ParseBudgetContext context = PARSE_BUDGET.get();
+        if (context != null) {
+            context.incrementAttributeCount(count);
+        }
+    }
+
     protected void notifyUnknownPolicyElement(Object childElement) {
         //NO-Op - subclass could log or throw exception or something
     }

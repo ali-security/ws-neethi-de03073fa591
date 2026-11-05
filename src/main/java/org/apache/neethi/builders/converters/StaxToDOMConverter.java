@@ -32,6 +32,8 @@ import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 
+import org.apache.neethi.PolicyBuilder;
+
 /**
  * 
  */
@@ -64,6 +66,12 @@ public class StaxToDOMConverter extends AbstractStaxConverter
                     e.setPrefix(reader.getPrefix());
                 }       
                 e = (Element)parent.appendChild(e);
+
+                // charge every node materialized for an assertion subtree
+                // against the budget of the parse that requested it; the
+                // operator walk in PolicyBuilder never sees these nodes
+                PolicyBuilder.chargeAmbientElement();
+                PolicyBuilder.chargeAmbientAttributes(reader.getAttributeCount());
 
                 for (int ns = 0; ns < reader.getNamespaceCount(); ns++) {
                     String uri = reader.getNamespaceURI(ns);
